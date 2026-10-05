@@ -1,0 +1,492 @@
+
+#!/usr/bin/env python3
+"""
+Words API — API + Web панель в одном файле.
+Без сырых сообщений и деанона. Только статистика по словам.
+"""
+import os
+import secrets
+import sqlite3
+import time
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+
+DB_PATH = os.getenv("DB_PATH", "/data/chat_parser.db")
+KEYS_DB = os.getenv("KEYS_DB", "/data/api_keys.db")
+PORT = int(os.getenv("PORT", "8000"))
+
+app = FastAPI(title="Words API", version="1.0", docs_url="/docs")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+
+# ============ БД КЛЮЧЕЙ ============
+def init_keys():
+    os.makedirs(os.path.dirname(KEYS_DB) or ".", exist_ok=True)
+    c = sqlite3.connect(KEYS_DB)
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS api_keys (
+            key TEXT PRIMARY KEY,
+            name TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            requests INTEGER DEFAULT 0,
+            last_used TIMESTAMP,
+            active INTEGER DEFAULT 1);
+    """)
+    c.commit()
+    c.close()
+
+
+def validate_key(key):
+    if not key:
+        return None
+    try:
+        c = sqlite3.connect(KEYS_DB, timeout=10)
+        row = c.execute(
+            "SELECT name FROM api_keys WHERE key=? AND active=1", (key,)
+        ).fetchone()
+        if not row:
+            c.close()
+            return None
+        c.execute(
+            "UPDATE api_keys SET requests=requests+1, last_used=CURRENT_TIMESTAMP WHERE key=?",
+            (key,),
+        )
+        c.commit()
+        c.close()
+        return row[0]
+    except Exception:
+        return None
+
+
+def require(key: str):
+    if not validate_key(key):
+        raise HTTPException(403, "Invalid or missing API key")
+
+
+def db():
+    if not os.path.exists(DB_PATH):
+        raise HTTPException(503, "База не найдена на сервере")
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.execute("PRAGMA busy_timeout=30000")
+    c.row_factory = sqlite3.Row
+    return c
+
+
+@app.on_event("startup")
+def startup():
+    init_keys()
+    boot = os.getenv("BOOTSTRAP_KEY", "").strip()
+    if boot:
+        c = sqlite3.connect(KEYS_DB)
+        exists = c.execute("SELECT 1 FROM api_keys WHERE key=?", (boot,)).fetchone()
+        if not exists:
+            c.execute("INSERT INTO api_keys (key, name) VALUES (?, ?)", (boot, "bootstrap"))
+            c.commit()
+            print("[+] bootstrap key создан")
+        c.close()
+
+
+# ============ API ============
+@app.get("/healthz")
+def health():
+    return {"ok": True, "db_present": os.path.exists(DB_PATH), "db_path": DB_PATH}
+
+
+@app.get("/stats")
+def stats(key: str = Query(...)):
+    require(key)
+    c = db()
+    try:
+        r = c.execute("""
+            SELECT
+              (SELECT COUNT(*) FROM words) AS total_words,
+              (SELECT COUNT(DISTINCT word) FROM words) AS uniq_words,
+              (SELECT COUNT(DISTINCT user_id) FROM words) AS uniq_users,
+              (SELECT COUNT(DISTINCT chat_id) FROM words) AS uniq_chats
+        """).fetchone()
+        return dict(r)
+    finally:
+        c.close()
+
+
+@app.get("/top")
+def top_chat(chat_id: str, key: str = Query(...), limit: int = Query(50, ge=1, le=500)):
+    require(key)
+    c = db()
+    try:
+        rows = c.execute("""
+            SELECT word, n FROM word_stats
+            WHERE chat_id=? ORDER BY n DESC LIMIT ?
+        """, (str(chat_id), limit)).fetchall()
+        if not rows:
+            rows = c.execute("""
+                SELECT word, COUNT(*) AS n FROM words
+                WHERE chat_id=? GROUP BY word ORDER BY n DESC LIMIT ?
+            """, (str(chat_id), limit)).fetchall()
+        if not rows:
+            raise HTTPException(404, "chat not found or no words")
+        return {"chat_id": chat_id, "count": len(rows), "words": [dict(r) for r in rows]}
+    finally:
+        c.close()
+
+
+@app.get("/top_all")
+def top_all(key: str = Query(...), limit: int = Query(100, ge=1, le=1000)):
+    require(key)
+    c = db()
+    try:
+        rows = c.execute("""
+            SELECT word, SUM(n) AS total FROM word_stats
+            GROUP BY word ORDER BY total DESC LIMIT ?
+        """, (limit,)).fetchall()
+        return {"count": len(rows), "words": [dict(r) for r in rows]}
+    finally:
+        c.close()
+
+
+@app.get("/user/{user_id}")
+def user_words(user_id: str, key: str = Query(...), limit: int = Query(50, ge=1, le=500)):
+    require(key)
+    c = db()
+    try:
+        rows = c.execute("""
+            SELECT word, COUNT(*) AS n FROM words
+            WHERE user_id=? GROUP BY word ORDER BY n DESC LIMIT ?
+        """, (str(user_id), limit)).fetchall()
+        if not rows:
+            raise HTTPException(404, "user not found or no words")
+        return {"user_id": user_id, "count": len(rows), "words": [dict(r) for r in rows]}
+    finally:
+        c.close()
+
+
+@app.get("/word/{word}")
+def word_users(word: str, key: str = Query(...), limit: int = Query(50, ge=1, le=500)):
+    require(key)
+    word = word.lower().strip()
+    c = db()
+    try:
+        rows = c.execute("""
+            SELECT w.user_id, u.username, u.first_name, COUNT(*) AS n
+            FROM words w
+            LEFT JOIN users u ON u.chat_id=w.chat_id AND u.user_id=w.user_id
+            WHERE w.word=? GROUP BY w.user_id ORDER BY n DESC LIMIT ?
+        """, (word, limit)).fetchall()
+        if not rows:
+            raise HTTPException(404, "word not found")
+        return {"word": word, "count": len(rows), "users": [dict(r) for r in rows]}
+    finally:
+        c.close()
+
+
+@app.get("/chat/{chat_id}/word/{word}")
+def word_in_chat(chat_id: str, word: str, key: str = Query(...)):
+    require(key)
+    word = word.lower().strip()
+    c = db()
+    try:
+        total = c.execute(
+            "SELECT COUNT(*) FROM words WHERE chat_id=? AND word=?",
+            (str(chat_id), word),
+        ).fetchone()[0]
+        if total == 0:
+            raise HTTPException(404, "word not found in chat")
+        top = c.execute("""
+            SELECT w.user_id, u.username, u.first_name, COUNT(*) AS n
+            FROM words w
+            LEFT JOIN users u ON u.chat_id=w.chat_id AND u.user_id=w.user_id
+            WHERE w.chat_id=? AND w.word=?
+            GROUP BY w.user_id ORDER BY n DESC LIMIT 10
+        """, (str(chat_id), word)).fetchall()
+        return {
+            "chat_id": chat_id, "word": word, "total": total,
+            "top_users": [dict(r) for r in top],
+        }
+    finally:
+        c.close()
+
+
+@app.get("/chats")
+def list_chats(key: str = Query(...)):
+    require(key)
+    c = db()
+    try:
+        rows = c.execute("""
+            SELECT c.chat_id, c.title, c.username,
+                   (SELECT COUNT(*) FROM messages m WHERE m.chat_id=c.chat_id) AS msgs
+            FROM chats c
+            WHERE (SELECT COUNT(*) FROM messages m WHERE m.chat_id=c.chat_id) > 0
+            ORDER BY msgs DESC LIMIT 500
+        """).fetchall()
+        return {"count": len(rows), "chats": [dict(r) for r in rows]}
+    finally:
+        c.close()
+
+
+# ============ HTML ПАНЕЛЬ (встроена) ============
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Words API — панель</title>
+<style>
+:root{--bg:#08080a;--surface:#111114;--surface-2:#16161a;--fg:#f2f2f4;--fg-2:#c8c8ce;--muted:#8a8a92;--faint:#5a5a63;--line:#1f1f24;--primary:#3b82f6;--primary-hover:#2f6fe0;--ok:#4ade80;--danger:#f87171;--sans:"Inter","Segoe UI",system-ui,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,monospace;--r-lg:16px;--r-md:12px;--wrap:1100px}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{min-height:100%;background:var(--bg);color:var(--fg)}
+body{font-family:var(--sans);font-size:15px;line-height:1.5}
+a{color:var(--primary);text-decoration:none}
+button{cursor:pointer;font-family:inherit;color:inherit}
+.topbar{position:sticky;top:0;z-index:50;background:rgba(8,8,10,.85);backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+.topbar-inner{max-width:var(--wrap);margin:0 auto;padding:14px 24px;display:flex;align-items:center;justify-content:space-between}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700}
+.brand svg{width:24px;height:24px}
+.top-nav a{padding:8px 14px;border-radius:9px;font-size:14px;color:var(--muted);margin-left:6px}
+.top-nav a:hover,.top-nav a.active{background:var(--surface);color:var(--fg)}
+.main{max-width:var(--wrap);margin:0 auto;padding:40px 24px 80px}
+h1{font-size:clamp(1.8rem,4vw,2.6rem);font-weight:800;letter-spacing:-.03em;margin-bottom:12px}
+h2{font-size:18px;font-weight:700;letter-spacing:-.02em;margin:32px 0 14px}
+p.lead{color:var(--muted);max-width:640px;margin-bottom:24px}
+.grid{display:grid;grid-template-columns:1fr 380px;gap:20px;align-items:start}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.card{padding:22px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--surface);margin-bottom:20px}
+.card h3{font-size:15px;font-weight:700;margin-bottom:14px;letter-spacing:-.01em}
+.field{margin-bottom:12px}
+.lbl{display:block;font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin-bottom:6px}
+.inp{width:100%;padding:12px 14px;border-radius:8px;background:var(--bg);border:1px solid var(--line);color:var(--fg);font-size:14px;outline:none}
+.inp:focus{border-color:var(--primary)}
+.btn{width:100%;padding:13px 18px;border:none;border-radius:8px;background:var(--primary);color:#fff;font-size:14px;font-weight:600;transition:background .15s}
+.btn:hover{background:var(--primary-hover)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.tbl{width:100%;border-collapse:collapse;font-size:14px;margin-top:12px}
+.tbl th{text-align:left;padding:9px 12px;font-size:11px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);border-bottom:1px solid var(--line);background:var(--surface-2)}
+.tbl td{padding:10px 12px;border-top:1px solid var(--line);color:var(--fg-2)}
+.tbl tr:first-child td{border-top:none}
+.tbl .num{font-family:var(--mono);color:var(--primary);font-weight:600}
+.err{margin-top:12px;padding:12px 14px;background:rgba(248,113,113,.06);border:1px solid rgba(248,113,113,.3);border-radius:8px;color:var(--danger);font-size:13px;display:none}
+.err.show{display:block}
+.res{margin-top:14px;display:none}
+.res.show{display:block}
+.hint{font-size:12px;color:var(--muted);margin-top:6px}
+.code{font-family:var(--mono);font-size:12px;background:var(--surface-2);padding:3px 7px;border-radius:5px}
+.stat-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line)}
+.stat-row:last-child{border-bottom:none}
+.stat-row b{font-family:var(--mono);color:var(--primary)}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+        <circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/>
+        <path d="M12 1v4M12 19v4M1 12h4M19 12h4" stroke-linecap="round"/>
+      </svg>
+      Words API
+    </div>
+    <nav class="top-nav">
+      <a href="#" class="active" data-nav="home">Панель</a>
+      <a href="/docs" target="_blank">API Docs</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main">
+
+  <h1>Панель Words API</h1>
+  <p class="lead">Топ слов по чату и по всей базе, слова конкретного юзера, кто использует слово. Только статистика — без сырых сообщений.</p>
+
+  <div class="card">
+    <h3>1. Подключение</h3>
+    <div class="field">
+      <label class="lbl" for="apiKey">API-ключ</label>
+      <input class="inp" id="apiKey" placeholder="wapi_..." autocomplete="off">
+      <div class="hint">Создай: <span class="code">python main.py add-key main</span></div>
+    </div>
+    <button class="btn" id="saveBtn">Проверить и сохранить</button>
+    <div class="err" id="connErr"></div>
+    <div class="res" id="statsRes">
+      <h3 style="margin-top:16px">Статистика базы</h3>
+      <div id="statsBody"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>2. Топ слов по всей базе</h3>
+    <button class="btn" id="topAllBtn" style="margin-bottom:12px">Загрузить топ-50</button>
+    <div class="err" id="topAllErr"></div>
+    <div id="topAllRes"></div>
+  </div>
+
+  <div class="card">
+    <h3>3. Топ слов по чату</h3>
+    <div class="field">
+      <label class="lbl" for="chatId">chat_id</label>
+      <input class="inp" id="chatId" placeholder="2592657874">
+      <div class="hint">Список чатов: <span class="code">/chats?key=...</span></div>
+    </div>
+    <button class="btn" id="topChatBtn">Топ-50 этого чата</button>
+    <div class="err" id="topChatErr"></div>
+    <div id="topChatRes"></div>
+  </div>
+
+  <div class="card">
+    <h3>4. Слова юзера</h3>
+    <div class="field">
+      <label class="lbl" for="userId">user_id</label>
+      <input class="inp" id="userId" placeholder="1636576830">
+    </div>
+    <button class="btn" id="userBtn">Топ-50 слов этого юзера</button>
+    <div class="err" id="userErr"></div>
+    <div id="userRes"></div>
+  </div>
+
+  <div class="card">
+    <h3>5. Кто использует слово</h3>
+    <div class="field">
+      <label class="lbl" for="wordInp">Слово</label>
+      <input class="inp" id="wordInp" placeholder="подарок">
+    </div>
+    <button class="btn" id="wordBtn">Найти юзеров</button>
+    <div class="err" id="wordErr"></div>
+    <div id="wordRes"></div>
+  </div>
+
+</main>
+
+<script>
+'use strict';
+const LS_KEY = 'words_api_key';
+const API_BASE = location.origin;
+
+function $(id){return document.getElementById(id)}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]))}
+
+function loadCfg(){ $('apiKey').value = localStorage.getItem(LS_KEY) || ''; }
+function saveCfg(){ localStorage.setItem(LS_KEY, $('apiKey').value.trim()); }
+function key(){ return $('apiKey').value.trim(); }
+
+async function api(path){
+  const url = API_BASE + path + (path.includes('?')?'&':'?') + 'key=' + encodeURIComponent(key());
+  const r = await fetch(url);
+  const text = await r.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {} } catch(e) { data = { raw: text } }
+  if (!r.ok) {
+    const e = new Error(data.detail || data.error || ('HTTP ' + r.status));
+    e.data = data; throw e;
+  }
+  return data;
+}
+
+function showErr(id, msg){ const el = $(id); el.textContent = msg; el.classList.add('show'); }
+function hideErr(id){ $(id).classList.remove('show'); }
+
+function renderTable(container, words){
+  if(!words || !words.length){ container.innerHTML = '<p style="color:var(--muted);margin-top:12px">Пусто</p>'; return; }
+  let h = '<table class="tbl"><thead><tr><th>#</th><th>Слово</th><th>Частота</th></tr></thead><tbody>';
+  words.forEach((w,i)=>{ h += `<tr><td>${i+1}</td><td>${esc(w.word)}</td><td class="num">${w.n ?? w.total ?? 0}</td></tr>` });
+  h += '</tbody></table>';
+  container.innerHTML = h;
+}
+
+$('saveBtn').addEventListener('click', async () => {
+  hideErr('connErr'); saveCfg();
+  const btn = $('saveBtn'); btn.disabled = true; btn.textContent = 'Проверка...';
+  try {
+    const d = await api('/stats');
+    const rows = [['Всего слов', d.total_words], ['Уникальных', d.uniq_words], ['Юзеров', d.uniq_users], ['Чатов', d.uniq_chats]];
+    let h = '<table class="tbl"><tbody>';
+    rows.forEach(([k,v])=>{ h += `<tr><td>${k}</td><td class="num">${Number(v||0).toLocaleString('ru')}</td></tr>` });
+    h += '</tbody></table>';
+    $('statsBody').innerHTML = h;
+    $('statsRes').classList.add('show');
+    btn.textContent = 'Подключено ✓';
+  } catch(e) {
+    showErr('connErr', 'Ошибка: ' + e.message);
+    btn.textContent = 'Проверить и сохранить';
+  } finally { btn.disabled = false; }
+});
+
+$('topAllBtn').addEventListener('click', async () => {
+  hideErr('topAllErr'); const b = $('topAllBtn'); b.disabled = true; b.textContent = 'Загрузка...';
+  try { const d = await api('/top_all?limit=50'); renderTable($('topAllRes'), d.words); }
+  catch(e){ showErr('topAllErr', e.message); }
+  finally { b.disabled = false; b.textContent = 'Загрузить топ-50'; }
+});
+
+$('topChatBtn').addEventListener('click', async () => {
+  hideErr('topChatErr'); const cid = $('chatId').value.trim();
+  if(!cid){ showErr('topChatErr','Введи chat_id'); return; }
+  const b = $('topChatBtn'); b.disabled = true; b.textContent = 'Загрузка...';
+  try { const d = await api('/top?chat_id='+encodeURIComponent(cid)+'&limit=50'); renderTable($('topChatRes'), d.words); }
+  catch(e){ showErr('topChatErr', e.message); }
+  finally { b.disabled = false; b.textContent = 'Топ-50 этого чата'; }
+});
+
+$('userBtn').addEventListener('click', async () => {
+  hideErr('userErr'); const uid = $('userId').value.trim();
+  if(!uid){ showErr('userErr','Введи user_id'); return; }
+  const b = $('userBtn'); b.disabled = true; b.textContent = 'Загрузка...';
+  try { const d = await api('/user/'+encodeURIComponent(uid)+'?limit=50'); renderTable($('userRes'), d.words); }
+  catch(e){ showErr('userErr', e.message); }
+  finally { b.disabled = false; b.textContent = 'Топ-50 слов этого юзера'; }
+});
+
+$('wordBtn').addEventListener('click', async () => {
+  hideErr('wordErr'); const w = $('wordInp').value.trim();
+  if(!w){ showErr('wordErr','Введи слово'); return; }
+  const b = $('wordBtn'); b.disabled = true; b.textContent = 'Загрузка...';
+  try {
+    const d = await api('/word/'+encodeURIComponent(w)+'?limit=50');
+    if(!d.users || !d.users.length){ $('wordRes').innerHTML = '<p style="color:var(--muted);margin-top:12px">Никто не использует</p>'; }
+    else {
+      let h = '<table class="tbl"><thead><tr><th>user_id</th><th>username</th><th>имя</th><th>раз</th></tr></thead><tbody>';
+      d.users.forEach(u => {
+        h += `<tr><td>${esc(u.user_id)}</td><td>${u.username?'@'+esc(u.username):'—'}</td><td>${esc(u.first_name||'')}</td><td class="num">${u.n}</td></tr>`;
+      });
+      h += '</tbody></table>';
+      $('wordRes').innerHTML = h;
+    }
+  } catch(e){ showErr('wordErr', e.message); }
+  finally { b.disabled = false; b.textContent = 'Найти юзеров'; }
+});
+
+loadCfg();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTMLResponse(HTML_PAGE)
+
+
+# ============ CLI ============
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "add-key":
+        init_keys()
+        name = sys.argv[2] if len(sys.argv) > 2 else f"client_{int(time.time())}"
+        k = "wapi_" + secrets.token_urlsafe(32)
+        c = sqlite3.connect(KEYS_DB)
+        c.execute("INSERT INTO api_keys (key, name) VALUES (?, ?)", (k, name))
+        c.commit()
+        c.close()
+        print(f"✅ {name}: {k}")
+    else:
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=PORT)
+PY_EOF
+
+chmod +x ~/words-api/main.py
+python3 -m py_compile ~/words-api/main.py && echo OK
